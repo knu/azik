@@ -249,6 +249,7 @@ ko             こ
 kp             こう
 kq             かい
 kr             から
+ks             くださ
 kt             こと
 ku             く
 kv             きゅう
