@@ -1,0 +1,430 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+#
+# Import, export, and diff the roman input table embedded in an ATOK style plist.
+
+require "base64"
+require "optparse"
+require "stringio"
+require "tempfile"
+require "tmpdir"
+
+ROMAJI_KEY_PATTERN = %r{(?<prefix><key>ローマ字</key>\s*<data>\s*)(?<body>.*?)(?<suffix>\s*</data>)}m
+
+# The "ローマ字" plist data is a fixed-size ATOK binary table.
+#
+# Known layout:
+#
+# - 0x0000..0x0007: Header
+#   - uint16 at 0x0002 is the total internal entry count.
+#   - 0x0100 at 0x0004 and 0x0002 at 0x0006 indicate a 256-entry
+#     UTF-16-style table with 2-byte words.
+# - 0x0008..0x0207: 256 big-endian uint16 values
+#   - The range beginning at ROMAJI_ROOT_RANGE_OFFSET stores [start, count]
+#     pairs for entries whose first key character is "b".."z".
+#   - ROMAJI_SENTINELS store the total entry count.
+#   - Other values are left as ATOK generated them; they appear to describe
+#     lookup metadata for characters outside the normal exported key range.
+# - 0x0208..0x1127: 4-byte records
+#   - The first ROMAJI_RECORD_SKIP entries are represented only in the string
+#     pool.  Records begin at logical entry ROMAJI_RECORD_SKIP.
+#   - Each record is: uint16 offset_words, uint8 key_words, uint8 value_words.
+#   - offset_words is relative to ROMAJI_POOL_OFFSET and counts 16-bit words.
+#   - Empty record slots use PADDING_RECORD.
+# - 0x1128..: String pool
+#   - Each entry is key words followed by value words.
+#   - Keys are ASCII characters encoded as UTF-16BE words.  Internal helper
+#     keys use 0x001e for "n" -> "ん" and 0x001f for consonant -> "っ".
+#   - Values use ATOK's half-width katakana-like representation in UTF-16BE:
+#     U+FF61..U+FF9F plus a few private control words for ゐ/ゑ/ヵ/ヶ/ゎ.
+#   - Voicing marks are stored as separate U+FF9E/U+FF9F words.
+# - The remaining bytes are preserved from the template plist.  ATOK keeps
+#   spare/stale pool data after edits, so import rewrites only the generated
+#   record area and the live string pool, leaving trailing bytes intact.
+ROMAJI_POOL_OFFSET = 0x1128
+ROMAJI_RECORD_OFFSET = 0x0208
+ROMAJI_RECORD_SKIP = 32
+ROMAJI_ROOT_RANGE_OFFSET = 0x84
+ROMAJI_SENTINELS = [0xb6, 0xb8, 0xba, 0xbc, 0xbe].freeze
+PADDING_RECORD = [0, 2, 3].pack("nCC")
+KEY_WORDS = ((0x21..0x7e).to_a + [0x001e, 0x001f]).freeze
+DEFAULT_PLIST_PATTERN = "~/Library/Preferences/ATOK[0-9]*/Styles/StUser0.plist"
+SPECIAL_VALUE_CHARS = {
+  0x0010 => "ゐ",
+  0x0011 => "ゑ",
+  0x0012 => "ヵ",
+  0x0013 => "ヶ",
+  0x0014 => "ゎ",
+}.freeze
+
+def halfwidth_map
+  chars = (0xff61..0xff9f).map { |codepoint| codepoint.chr("UTF-8") }
+  map = {
+    "ヰ" => "\u0010",
+    "ヱ" => "\u0011",
+    "ヵ" => "\u0012",
+    "ヶ" => "\u0013",
+    "ヮ" => "\u0014",
+    "゛" => "\uff9e",
+    "゜" => "\uff9f",
+  }
+
+  (1..2).each do |length|
+    chars.repeated_permutation(length) do |seq|
+      halfwidth = seq.join
+      fullwidth = halfwidth.unicode_normalize(:nfkc)
+      fullwidth.length == 1 or next
+
+      map[fullwidth] = halfwidth if !map.key?(fullwidth) || halfwidth.length < map[fullwidth].length
+    end
+  end
+
+  map
+end
+
+def hira_to_kata(string)
+  string.each_char.map { |char|
+    case char.ord
+    when 0x3041..0x3096
+      (char.ord + 0x60).chr("UTF-8")
+    else
+      char
+    end
+  }.join
+end
+
+def encoded_value(value, halfwidth)
+  hira_to_kata(value).each_char.map { |char| halfwidth.fetch(char) }.join.encode("UTF-16BE").b
+end
+
+def entry_value(entry)
+  decode_value(entry.value_bytes)
+end
+
+def latest_plist_path
+  Dir.glob(File.expand_path(DEFAULT_PLIST_PATTERN))
+    .max_by { |candidate|
+      candidate[%r{/ATOK(\d+)/Styles/}, 1].to_i
+    } or abort("default plist not found under #{DEFAULT_PLIST_PATTERN}")
+end
+
+def read_text(path)
+  File.read(path, mode: "rb:BOM|UTF-8").encode("UTF-8")
+end
+
+Entry = Struct.new(:key, :key_bytes, :value_bytes, :offset_words, keyword_init: true) do
+  def record
+    [offset_words, key_bytes.bytesize / 2, value_bytes.bytesize / 2].pack("nCC")
+  end
+
+  def bytes
+    key_bytes + value_bytes
+  end
+end
+
+def romaji_entries(path)
+  raw_entries = read_text(path).each_line.each_with_object([]) do |line, result|
+    match = /^([!-~]+)[ \t]+(.+?)\s*$/.match(line) or next
+
+    result << match.captures
+  end
+
+  halfwidth = halfwidth_map
+  sokuon_prefixes = "bcdfghjklmnprstvwxyz".chars
+  seen_prefixes = {}
+  entries = []
+
+  raw_entries.each do |key, value|
+    char = key[0]
+    if sokuon_prefixes.include?(char) && !seen_prefixes[char]
+      if char == "n"
+        entries << Entry.new(key: "n\u001e", key_bytes: [0x006e, 0x001e].pack("n*"), value_bytes: [0xff9d].pack("n"))
+      end
+      entries << Entry.new(
+        key: "#{char}\u001f",
+        key_bytes: [char.ord, 0x001f].pack("n*"),
+        value_bytes: [0xff6f].pack("n"),
+      )
+      seen_prefixes[char] = true
+    end
+
+    entries << Entry.new(key: key, key_bytes: key.encode("UTF-16BE").b, value_bytes: encoded_value(value, halfwidth))
+  end
+
+  offset_words = 0
+  entries.each do |entry|
+    entry.offset_words = offset_words
+    offset_words += entry.bytes.bytesize / 2
+  end
+
+  entries
+end
+
+def extract_romaji_data(plist)
+  match = ROMAJI_KEY_PATTERN.match(plist) or abort("romaji data not found")
+
+  [match, Base64.decode64(match[:body])]
+end
+
+def encode_data(data)
+  Base64.strict_encode64(data).scan(/.{1,68}/).map { |line| "\t#{line}" }.join("\n")
+end
+
+def write_uint16(data, offset, value)
+  data.seek(offset)
+  data.write([value].pack("n"))
+end
+
+def write_table_entry(data, index, value)
+  write_uint16(data, 8 + index * 2, value)
+end
+
+def compile_data(template, entries)
+  data = StringIO.new(template.dup.b)
+  write_uint16(data, 2, entries.size)
+
+  ("b".."z").each do |letter|
+    range_index = ROMAJI_ROOT_RANGE_OFFSET + (letter.ord - "b".ord) * 2
+    start = entries.index { |entry| entry.key.start_with?(letter) }
+    count = entries.count { |entry| entry.key.start_with?(letter) }
+    write_table_entry(data, range_index, start || entries.size)
+    write_table_entry(data, range_index + 1, count)
+  end
+  ROMAJI_SENTINELS.each do |index|
+    write_table_entry(data, index, entries.size)
+  end
+
+  records = entries[ROMAJI_RECORD_SKIP..].map(&:record)
+  records << PADDING_RECORD while records.size < entries.size
+  abort("generated record table is too large") if ROMAJI_RECORD_OFFSET + records.join.bytesize > ROMAJI_POOL_OFFSET
+
+  data.seek(ROMAJI_RECORD_OFFSET)
+  data.write(records.join)
+  data.seek(ROMAJI_POOL_OFFSET)
+  data.write(entries.map(&:bytes).join)
+  data.string
+end
+
+def read_word(data, offset)
+  data.getbyte(offset) << 8 | data.getbyte(offset + 1)
+end
+
+def key_word?(word)
+  KEY_WORDS.include?(word)
+end
+
+def decode_key(bytes)
+  words = bytes.unpack("n*")
+  words.map { |word| word.chr("UTF-8") }.join
+end
+
+def kata_to_hira(string)
+  string.each_char.map { |char|
+    case char.ord
+    when 0x30f4
+      "う゛"
+    when 0x30a1..0x30f6
+      (char.ord - 0x60).chr("UTF-8")
+    else
+      char
+    end
+  }.join
+end
+
+def decode_value(bytes)
+  chars = bytes.unpack("n*").map { |word|
+    SPECIAL_VALUE_CHARS.fetch(word) {
+      word.chr("UTF-8").unicode_normalize(:nfkc)
+    }
+  }
+
+  kata_to_hira(chars.join.unicode_normalize(:nfkc))
+end
+
+def parse_first_entries(data, limit_offset, count)
+  entries = []
+  offset = ROMAJI_POOL_OFFSET
+
+  while offset < limit_offset && entries.size < count
+    key_start = offset
+    offset += 2 while offset < limit_offset && key_word?(read_word(data, offset))
+    key_bytes = data.byteslice(key_start, offset - key_start)
+    value_start = offset
+    offset += 2 while offset < limit_offset && !key_word?(read_word(data, offset))
+    value_bytes = data.byteslice(value_start, offset - value_start)
+    entries << Entry.new(key: decode_key(key_bytes), key_bytes: key_bytes, value_bytes: value_bytes)
+  end
+
+  entries
+end
+
+def exported_entries(data)
+  count = read_word(data, 2)
+  first_record = data.byteslice(ROMAJI_RECORD_OFFSET, 4).unpack1("n")
+  entries = parse_first_entries(data, ROMAJI_POOL_OFFSET + first_record * 2, ROMAJI_RECORD_SKIP)
+
+  (ROMAJI_RECORD_SKIP...count).each do |index|
+    record = data.byteslice(ROMAJI_RECORD_OFFSET + (index - ROMAJI_RECORD_SKIP) * 4, 4)
+    next if record == PADDING_RECORD
+
+    offset_words, key_len, value_len = record.unpack("nCC")
+    offset = ROMAJI_POOL_OFFSET + offset_words * 2
+    key_bytes = data.byteslice(offset, key_len * 2)
+    value_bytes = data.byteslice(offset + key_len * 2, value_len * 2)
+    entries << Entry.new(key: decode_key(key_bytes), key_bytes: key_bytes, value_bytes: value_bytes)
+  end
+
+  entries.reject { |entry| internal_entry?(entry) }
+end
+
+def internal_entry?(entry)
+  words = entry.key_bytes.unpack("n*")
+  words.size == 2 && [0x001e, 0x001f].include?(words[1])
+end
+
+def user_entry_count(entries)
+  entries.count { |entry| !internal_entry?(entry) }
+end
+
+def export_text(data)
+  entries_text(exported_entries(data))
+end
+
+def entries_text(entries)
+  output = StringIO.new
+  entries.reject { |entry| internal_entry?(entry) }.each do |entry|
+    output.puts("#{entry.key.ljust(14)} #{decode_value(entry.value_bytes)}")
+  end
+  output.string
+end
+
+def import_command(argv)
+  check = false
+  parser = OptionParser.new do |opts|
+    opts.banner = <<~USAGE
+      Import an ATOK roman input table text file into an ATOK style plist.
+
+      Usage: #{$PROGRAM_NAME} import [--check] TEXT [PLIST]
+    USAGE
+    opts.on("--check", "Verify without writing") { check = true }
+  end
+  parser.parse!(argv)
+
+  text_path = argv.shift || abort(parser.to_s)
+  plist_path = argv.shift || latest_plist_path
+  abort(parser.to_s) unless argv.empty?
+
+  entries = romaji_entries(text_path)
+  plist = File.read(plist_path)
+  match, data = extract_romaji_data(plist)
+  updated_data = compile_data(data, entries)
+  count = user_entry_count(entries)
+
+  if data == updated_data
+    puts "Imported #{count} entries from #{text_path}; #{plist_path} is already up to date."
+    return
+  end
+
+  if check
+    puts "Import would update #{count} entries from #{text_path} into #{plist_path}."
+    return
+  end
+
+  updated_plist = plist.sub(ROMAJI_KEY_PATTERN) {
+    "#{match[:prefix]}#{encode_data(updated_data)}#{match[:suffix]}"
+  }
+
+  File.write(plist_path, updated_plist)
+  puts "Imported #{count} entries from #{text_path} into #{plist_path}."
+end
+
+def export_command(argv)
+  parser = OptionParser.new do |opts|
+    opts.banner = <<~USAGE
+      Export the roman input table from an ATOK style plist as UTF-8 text.
+
+      Usage: #{$PROGRAM_NAME} export TEXT [PLIST]
+    USAGE
+  end
+  parser.parse!(argv)
+
+  text_path = argv.shift || abort(parser.to_s)
+  plist_path = argv.shift || latest_plist_path
+  abort(parser.to_s) unless argv.empty?
+
+  _, data = extract_romaji_data(File.read(plist_path))
+  entries = exported_entries(data)
+  File.write(text_path, export_text(data), encoding: "UTF-8")
+  puts "Exported #{entries.size} entries from #{plist_path} to #{text_path}."
+end
+
+def romaji_entry_map(entries)
+  entries.reject { |entry| internal_entry?(entry) }.to_h { |entry| [entry.key, entry_value(entry)] }
+end
+
+def diff_command(argv)
+  parser = OptionParser.new do |opts|
+    opts.banner = <<~USAGE
+      Compare an ATOK roman input table text file with the table in an ATOK style plist.
+
+      Usage: #{$PROGRAM_NAME} diff TEXT [PLIST]
+    USAGE
+  end
+  parser.parse!(argv)
+
+  text_path = argv.shift || abort(parser.to_s)
+  plist_path = argv.shift || latest_plist_path
+  abort(parser.to_s) unless argv.empty?
+
+  text_entries = romaji_entries(text_path)
+  _, data = extract_romaji_data(File.read(plist_path))
+  plist_entries = exported_entries(data)
+
+  Dir.mktmpdir("atok-romaji-table") do |dir|
+    text_file = File.join(dir, File.basename(text_path))
+    plist_file = File.join(dir, File.basename(plist_path))
+    plist_file = File.join(dir, "plist-#{File.basename(plist_path)}") if text_file == plist_file
+    File.write(text_file, entries_text(text_entries))
+    File.write(plist_file, entries_text(plist_entries))
+
+    puts "Compared #{user_entry_count(text_entries)} text entries with #{plist_entries.size} plist entries."
+    Dir.chdir(dir) do
+      system(
+        "git",
+        "diff",
+        "--no-index",
+        "--color=auto",
+        "--no-textconv",
+        "--src-prefix=roman table from ",
+        "--dst-prefix=roman table from ",
+        File.basename(text_file),
+        File.basename(plist_file),
+      )
+    end
+  end
+end
+
+def main
+  command = ARGV.shift
+
+  case command
+  when "import"
+    import_command(ARGV)
+  when "export"
+    export_command(ARGV)
+  when "diff"
+    diff_command(ARGV)
+  else
+    abort(<<~USAGE)
+      Import, export, and diff the roman input table embedded in an ATOK style plist.
+
+      Usage:
+        #{$PROGRAM_NAME} import [--check] TEXT [PLIST]
+        #{$PROGRAM_NAME} export TEXT [PLIST]
+        #{$PROGRAM_NAME} diff TEXT [PLIST]
+    USAGE
+  end
+end
+
+main
