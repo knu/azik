@@ -13,7 +13,7 @@
 
 ## AUTHOR
 
-Copyright (c) 2016-2022 Akinori MUSHA.
+Copyright (c) 2016-2026 Akinori MUSHA.
 
 Licensed under the 2-clause BSD license.  See `LICENSE.txt` for
 details.
