@@ -496,6 +496,7 @@ tsi	つぃ
 tsj	つん
 tsk	つぃん
 tsl	つぉん
+tsm	たしま
 tsn	つぁん
 tso	つぉ
 tsp	つぉー
