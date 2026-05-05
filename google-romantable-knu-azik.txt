@@ -494,7 +494,7 @@ tse	つぇ
 tsh	つう
 tsi	つぃ
 tsj	つん
-tsk	つぃん
+tsk	たしか
 tsl	つぉん
 tsm	たしま
 tsn	つぁん
