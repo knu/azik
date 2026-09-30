@@ -25,6 +25,20 @@
 - Google日本語入力用
     - こちらはふつうにインポート可能
 
+## mise でのインストール
+
+```sh
+mise use -g github:knu/azik@latest
+```
+
+`atok-romaji-table` を `PATH` から実行できます。利用には macOS と Ruby が必要です。
+2種類のローマ字テーブルはインストール先の `share/azik/` に同梱しています。
+
+```sh
+# 同梱テーブルと現在のATOKスタイルの差分を確認
+atok-romaji-table diff "$(mise where github:knu/azik)/share/azik/atok-romantable-knu-azik.txt"
+```
+
 ## SEE ALSO
 
 [AZIK総合解説書](http://hp.vector.co.jp/authors/VA002116/azik/azikinfo.htm)
